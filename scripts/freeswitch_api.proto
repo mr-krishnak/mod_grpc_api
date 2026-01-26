@@ -1,0 +1,16 @@
+syntax = "proto3";
+package fsgrpc;
+
+service FreeSwitchApi {
+  rpc Execute(ApiRequest) returns (ApiResponse) {}
+}
+
+message ApiRequest {
+  string command = 1;
+  string arguments = 2;
+}
+
+message ApiResponse {
+  string message = 1;
+  bool success = 2;
+}
