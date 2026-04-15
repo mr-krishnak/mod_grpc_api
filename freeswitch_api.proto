@@ -1,16 +1,48 @@
 syntax = "proto3";
 package fsgrpc;
 
-service FreeSwitchApi {
-  rpc Execute(ApiRequest) returns (ApiResponse) {}
+// One record row — works for any tabular FS output
+message Row {
+  map<string, string> fields = 1;
+}
+
+// Tabular output: show channels, sofia status, etc.
+message TableData {
+  repeated Row rows    = 1;
+  string       summary = 2;
+  uint32       count   = 3;
+}
+
+// Native JSON output: show X as json, uuid_dump json, etc.
+message JsonData {
+  uint32              row_count = 1;
+  repeated Row        rows      = 2;
+  map<string, string> fields    = 3;   // flat key-value JSON
+  string              raw       = 4;   // deeply nested — stored as string
+}
+
+// Plain / simple output: +OK, -ERR, version, etc.
+message PlainData {
+  string response = 1;
+  bool   ok       = 2;
 }
 
 message ApiRequest {
-  string command = 1;
+  string command   = 1;
   string arguments = 2;
 }
 
 message ApiResponse {
-  string message = 1;
-  bool success = 2;
+  bool      success = 1;
+  string    message = 2;   // raw text output (always set)
+  string    format  = 3;   // "json" | "xml" | "table" | "plain"
+
+  // Exactly ONE of these will be set based on format
+  TableData table = 4;
+  JsonData  json  = 5;
+  PlainData plain = 6;
+}
+
+service FreeSwitchApi {
+  rpc Execute(ApiRequest) returns (ApiResponse) {}
 }
