@@ -14,6 +14,8 @@
 #include <sstream>
 #include <vector>
 #include <algorithm>
+#include <chrono>
+#include <functional>
 
 using fsgrpc::ApiRequest;
 using fsgrpc::ApiResponse;
@@ -77,6 +79,9 @@ static bool looks_like_key_value_block(const std::vector<std::string> &lines)
     for (const auto &line : lines) {
         std::string trimmed = str_trim(line);
         if (trimmed.empty() || is_separator(line)) continue;
+
+        /* Lines without tabs are summary/footer text — acceptable in a KV block */
+        if (line.find('\t') == std::string::npos) continue;
 
         auto cols = split_tab(line);
         if (cols.size() != 2) return false;
@@ -166,7 +171,13 @@ static ApiExecutionResult execute_api_command(const std::string &cmd,
 static bool should_try_json_variant(const std::string &cmd,
                                     const std::string &args)
 {
-    return cmd == "show" && args.find(" as ") == std::string::npos;
+    if (cmd != "show") return false;
+    /* Reject if args already contain a format specifier:
+     * " as " anywhere, or "as " / "as" at the very start */
+    if (args.find(" as ") != std::string::npos) return false;
+    if (args.size() >= 3 && args.compare(0, 3, "as ") == 0) return false;
+    if (args == "as") return false;
+    return true;
 }
 
 /* ═══════════════════════════════════════════════════════════════
@@ -227,7 +238,10 @@ static bool fill_table(const std::string &raw, TableData *td)
     if (hdr < 0) return fill_key_value_table(lines, td);
 
     std::string summary;
-    for (size_t i = next_content_line(lines, (size_t)hdr + 1) + 1;
+    /* Fix: next_content_line returns lines.size() when nothing is found;
+     * adding 1 would wrap the unsigned value past 0, skipping all rows. */
+    size_t sep_idx = next_content_line(lines, (size_t)hdr + 1);
+    for (size_t i = (sep_idx < lines.size() ? sep_idx + 1 : lines.size());
          i < lines.size(); i++) {
         const std::string &l = lines[i];
         if (str_trim(l).empty() || is_separator(l)) continue;
@@ -276,9 +290,30 @@ static void fill_json(const std::string &raw, JsonData *jd)
             Row *row = jd->add_rows();
             /* FreeSWITCH cJSON: key field is "string" not "name" */
             for (cJSON *f = item->child; f; f = f->next) {
-                const char *key = f->string      ? f->string      : "";
-                const char *val = f->valuestring ? f->valuestring : "";
-                if (*key) (*row->mutable_fields())[key] = val;
+                const char *key = f->string ? f->string : "";
+                if (!*key) continue;
+                /* Fix: non-string types (number, bool) were silently dropped
+                 * as empty string because valuestring is NULL for them.      */
+                std::string val;
+                switch (f->type & 0xFF) {
+                    case cJSON_String:
+                        val = f->valuestring ? f->valuestring : "";
+                        break;
+                    case cJSON_Number: {
+                        char nbuf[64];
+                        snprintf(nbuf, sizeof(nbuf), "%g", f->valuedouble);
+                        val = nbuf;
+                        break;
+                    }
+                    case cJSON_True:  val = "true";  break;
+                    case cJSON_False: val = "false"; break;
+                    default: {
+                        char *s = cJSON_PrintUnformatted(f);
+                        if (s) { val = s; free(s); }
+                        break;
+                    }
+                }
+                (*row->mutable_fields())[key] = val;
             }
         }
     } else if ((root->type & 0xFF) == cJSON_Object) {
@@ -334,9 +369,32 @@ static void fill_plain(const std::string &raw, bool ok, PlainData *pd)
  * ═══════════════════════════════════════════════════════════════ */
 static void fill_xml_as_table(const std::string &raw, TableData *td)
 {
-    switch_xml_t root = switch_xml_parse_str(
-        const_cast<char *>(raw.c_str()), raw.size());
+    /* switch_xml_parse_str is destructive (null-terminates tokens in-place).
+     * Casting away const on c_str() and letting it write into the std::string
+     * buffer is UB.  Copy first.                                             */
+    std::string buf = raw;
+    switch_xml_t root = switch_xml_parse_str(buf.data(), buf.size());
     if (!root) return;
+
+    if (!root->child) {
+        /* Root has no child elements — extract root-level attributes and text
+         * so the caller can distinguish a valid (but childless) XML response
+         * from an unrecognised shape.                                        */
+        Row *row = td->add_rows();
+        if (root->attr) {
+            for (int i = 0; root->attr[i]; i += 2)
+                if (root->attr[i + 1])
+                    (*row->mutable_fields())[root->attr[i]] = root->attr[i + 1];
+        }
+        if (root->txt && root->txt[0])
+            (*row->mutable_fields())["value"] = root->txt;
+        if (row->fields_size() == 0)
+            td->clear_rows();   /* truly empty — no attributes or text */
+        else
+            td->set_count(1);
+        switch_xml_free(root);
+        return;
+    }
 
     for (switch_xml_t child = root->child; child; child = child->ordered) {
         Row *row = td->add_rows();
@@ -379,7 +437,6 @@ static void route_response(const std::string &content_type,
 
     } else if (fmt == "xml") {
         fill_xml_as_table(raw, response->mutable_table());
-        response->set_format("xml");
 
     } else {
         /* Plain text: try tab-separated table first */
@@ -393,55 +450,248 @@ static void route_response(const std::string &content_type,
 }
 
 /* ═══════════════════════════════════════════════════════════════
- *  1. SERVICE IMPLEMENTATION
+ *  THREAD POOL
+ *  Fixed-size worker pool backed by FreeSWITCH/APR threading.
+ *
+ *  switch_queue_t  — APR thread-safe bounded queue (switch_queue_*).
+ *  switch_thread_t — APR-managed OS thread (switch_thread_create).
+ *  Tasks are heap-allocated std::function<void()>* stored as void*.
+ *  switch_queue_term() unblocks all waiting workers on shutdown.
  * ═══════════════════════════════════════════════════════════════ */
-class ApiServiceImpl final : public FreeSwitchApi::Service
+class ThreadPool
 {
-    Status Execute(ServerContext     *context,
-                   const ApiRequest  *request,
-                   ApiResponse       *response) override
+public:
+    ThreadPool(size_t n, switch_memory_pool_t *pool) : pool_(pool)
     {
-        (void)context;
-        std::string cmd  = request->command();
-        std::string args = request->arguments();
+        /* Capacity well above max_concurrent_requests; queue never fills
+         * under normal operation because tasks are dispatched one per RPC. */
+        switch_queue_create(&queue_, 65535, pool_);
 
-        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
-                          "gRPC API: command=%s args=%s\n",
-                          cmd.c_str(), args.c_str());
+        workers_.resize(n, nullptr);
+        for (size_t i = 0; i < n; i++) {
+            switch_threadattr_t *attr = nullptr;
+            switch_threadattr_create(&attr, pool_);
+            switch_threadattr_detach_set(attr, 0); /* joinable */
+            switch_thread_create(&workers_[i], attr, worker_func, this, pool_);
+        }
+    }
 
-        ApiExecutionResult primary = execute_api_command(cmd, args);
-        ApiExecutionResult structured = primary;
-        bool               ok = (primary.status == SWITCH_STATUS_SUCCESS);
+    ~ThreadPool()
+    {
+        /* Bug fix: switch_queue_term() makes switch_queue_pop() return
+         * SWITCH_STATUS_GENERR immediately — even if items remain in the
+         * queue.  Drain any pending tasks first so their heap memory is
+         * freed.  Workers executing concurrently are unaffected.        */
+        void *item = nullptr;
+        while (switch_queue_trypop(queue_, &item) == SWITCH_STATUS_SUCCESS) {
+            delete static_cast<std::function<void()> *>(item);
+        }
+        /* Now signal workers to stop and wait for them */
+        switch_queue_term(queue_);
+        for (auto t : workers_) {
+            switch_status_t st;
+            switch_thread_join(&st, t);
+        }
+    }
 
-        response->set_success(ok);
-        response->set_message(primary.raw);
+    /* Returns false if the queue rejected the task (terminated or full).
+     * Caller must handle failure — task is NOT enqueued on false.       */
+    bool post(std::function<void()> f)
+    {
+        auto *task = new std::function<void()>(std::move(f));
+        if (switch_queue_push(queue_, task) != SWITCH_STATUS_SUCCESS) {
+            delete task;
+            return false;
+        }
+        return true;
+    }
 
-        if (ok && should_try_json_variant(cmd, args)) {
-            ApiExecutionResult json_variant =
-                execute_api_command(cmd, args + " as json");
+private:
+    static void *SWITCH_THREAD_FUNC worker_func(switch_thread_t * /*thread*/,
+                                                void             *obj)
+    {
+        auto *self = static_cast<ThreadPool *>(obj);
+        for (;;) {
+            void *item = nullptr;
+            if (switch_queue_pop(self->queue_, &item) != SWITCH_STATUS_SUCCESS)
+                break; /* queue terminated — shut down */
+            if (!item) break;
+            auto *task = static_cast<std::function<void()> *>(item);
+            (*task)();
+            delete task;
+        }
+        return nullptr;
+    }
 
-            if (json_variant.status == SWITCH_STATUS_SUCCESS &&
-                detect_format(json_variant.content_type, json_variant.raw) == "json") {
-                structured = std::move(json_variant);
+    switch_queue_t              *queue_  = nullptr;
+    switch_memory_pool_t        *pool_   = nullptr;
+    std::vector<switch_thread_t*> workers_;
+};
+
+/* ── Global State ─────────────────────────────────────────── */
+static struct
+{
+    std::unique_ptr<Server>                      server;
+    std::unique_ptr<grpc::ServerCompletionQueue> cq;
+    std::unique_ptr<ThreadPool>                  thread_pool;
+    switch_memory_pool_t                        *pool;
+    char                                        *listen_address;
+    uint32_t                                     max_concurrent_requests; /* 0 = unlimited */
+    int                                          worker_threads;
+} globals;
+
+/* Concurrency gate */
+static switch_mutex_t *g_concurrency_mutex = nullptr;
+static uint32_t        g_active_requests    = 0;
+static bool            g_shutting_down      = false;  /* set under g_concurrency_mutex */
+
+/* ═══════════════════════════════════════════════════════════════
+ *  COMMAND DENYLIST
+ *  Block commands that affect module/server lifecycle or could
+ *  lock out the gRPC service itself.
+ * ═══════════════════════════════════════════════════════════════ */
+static const char *DENIED_COMMANDS[] = {
+    "fsctl", "load", "unload", "reload", nullptr
+};
+
+static bool is_denied_command(const std::string &cmd)
+{
+    std::string lower = cmd;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    for (int i = 0; DENIED_COMMANDS[i]; i++)
+        if (lower == DENIED_COMMANDS[i]) return true;
+    return false;
+}
+
+/* ─── Config value parsers ──────────────────────────────────── */
+static bool parse_uint_cfg(const char *val, const char *param, uint32_t *out)
+{
+    char *end = nullptr;
+    long  v   = strtol(val, &end, 10);
+    if (!end || *end != '\0' || v < 0) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                          "gRPC API: invalid value for '%s': '%s' "
+                          "(expected non-negative integer)\n", param, val);
+        return false;
+    }
+    *out = (uint32_t)v;
+    return true;
+}
+
+static bool parse_int_cfg(const char *val, const char *param, int *out)
+{
+    char *end = nullptr;
+    long  v   = strtol(val, &end, 10);
+    if (!end || *end != '\0') {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                          "gRPC API: invalid value for '%s': '%s' "
+                          "(expected integer)\n", param, val);
+        return false;
+    }
+    *out = (int)v;
+    return true;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  CONFIG RELOAD — applies dynamic parameters at runtime.
+ *  listen-address, TLS, and gRPC thread-pool options require a
+ *  full module reload (unload + load) to take effect.
+ * ═══════════════════════════════════════════════════════════════ */
+static void do_config_reload(void)
+{
+    switch_xml_t cfg, xml, settings, param;
+    if ((xml = switch_xml_open_cfg("grpc_api.conf", &cfg, NULL))) {
+        if ((settings = switch_xml_child(cfg, "settings"))) {
+            for (param  = switch_xml_child(settings, "param");
+                 param; param = param->next) {
+                const char *var = switch_xml_attr_soft(param, "name");
+                const char *val = switch_xml_attr_soft(param, "value");
+                if (!strcmp(var, "max-concurrent-requests")) {
+                    parse_uint_cfg(val, var, &globals.max_concurrent_requests);
+                }
+                /* Note: listen-address, tls-*, worker-threads require a
+                 * module reload (unload + load) to take effect.             */
             }
         }
+        switch_xml_free(xml);
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+                          "gRPC API: config reloaded — max_concurrent=%u\n",
+                          globals.max_concurrent_requests);
+    } else {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+                          "gRPC API: could not open grpc_api.conf for reload\n");
+    }
+}
 
-        /* Fill the typed structured field — Postman renders this
-           as proper nested JSON with no escaping or binary       */
-        route_response(structured.content_type, structured.raw, ok, response);
-        return Status::OK;
+/* ─── FreeSWITCH API command: grpc_api reload|status ─────────── */
+SWITCH_STANDARD_API(grpc_api_cmd)
+{
+    if (zstr(cmd) || !strcasecmp(cmd, "help")) {
+        stream->write_function(stream,
+            "-ERR Usage: grpc_api <reload|status>\n"
+            "  reload — re-read grpc_api.conf (max-concurrent-requests only;\n"
+            "           other params need module reload)\n"
+            "  status — show current runtime values\n");
+        return SWITCH_STATUS_SUCCESS;
+    }
+    if (!strcasecmp(cmd, "reload")) {
+        do_config_reload();
+        stream->write_function(stream, "+OK Config reloaded\n");
+    } else if (!strcasecmp(cmd, "status")) {
+        uint32_t active = 0;
+        if (g_concurrency_mutex) {
+            switch_mutex_lock(g_concurrency_mutex);
+            active = g_active_requests;
+            switch_mutex_unlock(g_concurrency_mutex);
+        }
+        stream->write_function(stream,
+            "+OK listen=%s max_concurrent=%u worker_threads=%d "
+            "active_requests=%u shutting_down=%s\n",
+            globals.listen_address          ? globals.listen_address : "(none)",
+            globals.max_concurrent_requests,
+            globals.worker_threads,
+            active,
+            g_shutting_down                 ? "true" : "false");
+    } else {
+        stream->write_function(stream, "-ERR Unknown command: %s\n", cmd);
+    }
+    return SWITCH_STATUS_SUCCESS;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ *  CALL DATA
+ *  One heap-allocated instance per in-flight RPC.  The pointer
+ *  is used as the completion-queue tag so the polling loop can
+ *  find it again after each async operation completes.
+ *
+ *  State machine:
+ *    READY      — RequestExecute() posted; waiting for an
+ *                 incoming RPC from the client.
+ *    PROCESSING — RPC received; dispatched to worker thread.
+ *    FINISH     — Finish() called; waiting for the response
+ *                 send to complete (tag fires one final time).
+ * ═══════════════════════════════════════════════════════════════ */
+struct CallData
+{
+    fsgrpc::FreeSwitchApi::AsyncService          *service;
+    grpc::ServerCompletionQueue                  *cq;
+    grpc::ServerContext                           ctx;
+    ApiRequest                                    request;
+    ApiResponse                                   response;
+    grpc::ServerAsyncResponseWriter<ApiResponse>  responder;
+    enum State { READY, PROCESSING, FINISH }      state;
+    bool                                          counted; /* g_active_requests was incremented */
+
+    CallData(fsgrpc::FreeSwitchApi::AsyncService *svc,
+             grpc::ServerCompletionQueue         *cq_)
+        : service(svc), cq(cq_), responder(&ctx),
+          state(READY), counted(false)
+    {
+        service->RequestExecute(&ctx, &request, &responder, cq, cq, this);
     }
 };
 
-/* ── 2. Global State ────────────────────────────────────────── */
-static struct
-{
-    std::unique_ptr<Server> server;
-    switch_memory_pool_t   *pool;
-    char                   *listen_address;
-} globals;
-
-/* ── 3. Module Interface ────────────────────────────────────── */
+/* ── 2. Module Interface ────────────────────────────────────── */
 SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_api_load);
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_api_shutdown);
 SWITCH_MODULE_RUNTIME_FUNCTION(mod_grpc_api_runtime);
@@ -451,11 +701,25 @@ SWITCH_MODULE_DEFINITION(mod_grpc_api, mod_grpc_api_load,
 /* ── 4. Load ────────────────────────────────────────────────── */
 SWITCH_MODULE_LOAD_FUNCTION(mod_grpc_api_load)
 {
-    memset(&globals, 0, sizeof(globals));
-    globals.pool           = pool;
-    globals.listen_address = switch_core_strdup(globals.pool, "[::]:50051");
-    *module_interface      =
+    /* Do NOT memset globals — it contains a std::unique_ptr whose constructor
+     * has already run; memset-ting it is undefined behaviour.               */
+    globals.pool                    = pool;
+    globals.listen_address          = switch_core_strdup(pool, "[::]:50051");
+    globals.max_concurrent_requests = 0;   /* 0 = unlimited */
+    globals.worker_threads          = 4;
+
+    g_active_requests = 0;
+    g_shutting_down   = false;
+    switch_mutex_init(&g_concurrency_mutex, SWITCH_MUTEX_NESTED, pool);
+
+    *module_interface =
         switch_loadable_module_create_module_interface(pool, modname);
+
+    switch_api_interface_t *api_interface = NULL;
+    SWITCH_ADD_API(api_interface, "grpc_api",
+                   "gRPC API Module control",
+                   grpc_api_cmd, "[reload|status]");
+
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
                       "gRPC API Module (Typed JSON) Loaded\n");
     return SWITCH_STATUS_SUCCESS;
@@ -466,47 +730,203 @@ SWITCH_MODULE_RUNTIME_FUNCTION(mod_grpc_api_runtime)
 {
     switch_xml_t cfg, xml, settings, param;
 
-    if ((xml = switch_xml_open_cfg("grpc_api.conf", &cfg, NULL))) {
-        if ((settings = switch_xml_child(cfg, "settings"))) {
-            for (param  = switch_xml_child(settings, "param");
-                 param; param = param->next) {
-                const char *var = switch_xml_attr_soft(param, "name");
-                const char *val = switch_xml_attr_soft(param, "value");
-                if (!strcmp(var, "listen-address"))
-                    globals.listen_address =
-                        switch_core_strdup(globals.pool, val);
+    if (!(xml = switch_xml_open_cfg("grpc_api.conf", &cfg, NULL))) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+                          "gRPC API: could not open grpc_api.conf — "
+                          "module will not start\n");
+        return SWITCH_STATUS_TERM;
+    }
+    if ((settings = switch_xml_child(cfg, "settings"))) {
+        for (param  = switch_xml_child(settings, "param");
+             param; param = param->next) {
+            const char *var = switch_xml_attr_soft(param, "name");
+            const char *val = switch_xml_attr_soft(param, "value");
+            if (!strcmp(var, "listen-address")) {
+                globals.listen_address =
+                    switch_core_strdup(globals.pool, val);
+            } else if (!strcmp(var, "max-concurrent-requests")) {
+                parse_uint_cfg(val, var, &globals.max_concurrent_requests);
+            } else if (!strcmp(var, "worker-threads")) {
+                parse_int_cfg(val, var, &globals.worker_threads);
             }
         }
-        switch_xml_free(xml);
     }
+    switch_xml_free(xml);
 
-    ApiServiceImpl service;
-    ServerBuilder  builder;
+    if (globals.worker_threads < 1) globals.worker_threads = 1;
+
+    fsgrpc::FreeSwitchApi::AsyncService service;
+    ServerBuilder                       builder;
 
     grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+
     builder.AddListeningPort(globals.listen_address,
                              grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
+    globals.cq = builder.AddCompletionQueue();
 
     globals.server = builder.BuildAndStart();
     if (!globals.server) {
+        globals.cq.reset();
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                           "Failed to start gRPC Server on %s\n",
                           globals.listen_address);
         return SWITCH_STATUS_TERM;
     }
+
+    globals.thread_pool =
+        std::unique_ptr<ThreadPool>(new ThreadPool((size_t)globals.worker_threads,
+                                                    globals.pool));
+
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE,
-                      "gRPC Server (Typed JSON) on %s\n",
-                      globals.listen_address);
-    globals.server->Wait();
+                      "gRPC Server (Async) on %s — %d worker thread(s)%s\n",
+                      globals.listen_address,
+                      globals.worker_threads,
+                      (globals.max_concurrent_requests > 0 ?
+                          " [concurrency-limited]" : ""));
+
+    /* Seed one pending call slot so the server accepts the first RPC */
+    new CallData(&service, globals.cq.get());
+
+    /* ── Completion-queue polling loop ─────────────────────── */
+    void *tag;
+    bool  ok;
+    while (globals.cq->Next(&tag, &ok)) {
+        auto *call = static_cast<CallData *>(tag);
+
+        if (call->state == CallData::FINISH) {
+            /* Response has been sent (or server is shutting down) */
+            if (call->counted && globals.max_concurrent_requests > 0) {
+                switch_mutex_lock(g_concurrency_mutex);
+                if (g_active_requests > 0) g_active_requests--;
+                switch_mutex_unlock(g_concurrency_mutex);
+            }
+            delete call;
+            continue;
+        }
+
+        /* state == READY: an incoming RPC has arrived */
+        if (!ok) {
+            /* Server is shutting down — no RPC data, just clean up */
+            delete call;
+            continue;
+        }
+
+        /* Register a new slot for the next incoming RPC before processing this one */
+        new CallData(&service, globals.cq.get());
+        call->state = CallData::PROCESSING;
+
+        /* Concurrency gate — reject immediately (no blocking in async mode) */
+        if (globals.max_concurrent_requests > 0) {
+            switch_mutex_lock(g_concurrency_mutex);
+            bool over = g_shutting_down ||
+                        g_active_requests >= globals.max_concurrent_requests;
+            if (!over) {
+                g_active_requests++;
+                call->counted = true;
+            }
+            switch_mutex_unlock(g_concurrency_mutex);
+
+            if (over) {
+                const char *msg = g_shutting_down
+                    ? "-ERR Server shutting down"
+                    : "-ERR Server busy";
+                call->response.set_success(false);
+                call->response.set_message(std::string(msg) + "\n");
+                call->response.set_format("plain");
+                fill_plain(msg, false, call->response.mutable_plain());
+                call->state = CallData::FINISH;
+                call->responder.Finish(call->response, Status::OK, call);
+                continue;
+            }
+        }
+
+        /* Dispatch FreeSWITCH command execution to a worker thread */
+        if (!globals.thread_pool->post([call]() {
+            std::string cmd  = str_trim(call->request.command());
+            std::string args = call->request.arguments();
+
+            switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
+                              "gRPC API: command=%s args=%s\n",
+                              cmd.c_str(), args.c_str());
+
+            if (is_denied_command(cmd)) {
+                call->response.set_success(false);
+                call->response.set_message(
+                    "-ERR Command not permitted via gRPC API\n");
+                call->response.set_format("plain");
+                fill_plain("-ERR Command not permitted via gRPC API",
+                           false, call->response.mutable_plain());
+            } else {
+                ApiExecutionResult result;
+                bool               ok_cmd;
+
+                if (should_try_json_variant(cmd, args)) {
+                    std::string jargs =
+                        args.empty() ? "as json" : args + " as json";
+                    result = execute_api_command(cmd, jargs);
+                    if (result.status == SWITCH_STATUS_SUCCESS &&
+                        detect_format(result.content_type, result.raw) == "json") {
+                        ok_cmd = true;
+                    } else {
+                        result  = execute_api_command(cmd, args);
+                        ok_cmd  = (result.status == SWITCH_STATUS_SUCCESS);
+                    }
+                } else {
+                    result = execute_api_command(cmd, args);
+                    ok_cmd = (result.status == SWITCH_STATUS_SUCCESS);
+                }
+
+                call->response.set_success(ok_cmd);
+                call->response.set_message(result.raw);
+                route_response(result.content_type, result.raw,
+                               ok_cmd, &call->response);
+            }
+
+            call->state = CallData::FINISH;
+            call->responder.Finish(call->response, Status::OK, call);
+        })) {
+            /* Queue rejected the task — respond with error immediately */
+            if (call->counted && globals.max_concurrent_requests > 0) {
+                switch_mutex_lock(g_concurrency_mutex);
+                if (g_active_requests > 0) g_active_requests--;
+                switch_mutex_unlock(g_concurrency_mutex);
+            }
+            call->response.set_success(false);
+            call->response.set_message("-ERR Internal queue error\n");
+            call->response.set_format("plain");
+            fill_plain("-ERR Internal queue error", false,
+                       call->response.mutable_plain());
+            call->state = CallData::FINISH;
+            call->responder.Finish(call->response, Status::OK, call);
+        }
+    }
+
+    /* CQ fully drained — destroy thread pool (joins all worker threads) */
+    globals.thread_pool.reset();
     return SWITCH_STATUS_TERM;
 }
 
 /* ── 6. Shutdown ────────────────────────────────────────────── */
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_grpc_api_shutdown)
 {
+    /* Mark shutdown under mutex so in-flight concurrency checks see it */
+    if (g_concurrency_mutex) {
+        switch_mutex_lock(g_concurrency_mutex);
+        g_shutting_down = true;
+        switch_mutex_unlock(g_concurrency_mutex);
+    }
+
+    /* Graceful server shutdown — gives in-flight RPCs up to 2 s to finish */
     if (globals.server)
         globals.server->Shutdown(
             std::chrono::system_clock::now() + std::chrono::seconds(2));
+
+    /* Shutdown the completion queue.  This causes the runtime's cq->Next()
+     * polling loop to drain all remaining tags and eventually return false,
+     * at which point the runtime thread destroys the thread pool and exits. */
+    if (globals.cq)
+        globals.cq->Shutdown();
+
     return SWITCH_STATUS_SUCCESS;
 }

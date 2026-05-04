@@ -33,6 +33,7 @@ async function runWorker() {
                 if (!error && response.success) {
                     successCount++;
                 } else {
+                    // console.error("Error:", error ? error.message : response.message);
                     errorCount++;
                 }
                 resolve();
