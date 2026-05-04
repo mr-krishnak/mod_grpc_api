@@ -1,5 +1,21 @@
 <configuration name="grpc_api.conf" description="gRPC API Configuration">
   <settings>
+    <!-- Network -->
     <param name="listen-address" value="[::]:50051"/>
+
+    <!-- Concurrency control
+         max-concurrent-requests: maximum simultaneous in-flight Execute RPCs.
+           0 = unlimited.
+           Set this equal to your expected peak concurrent load.
+    -->
+    <param name="max-concurrent-requests" value="50"/>
+
+    <!-- Worker thread pool
+         worker-threads: number of threads that execute FreeSWITCH commands
+           in parallel.  The gRPC completion-queue polling thread is separate
+           and is never blocked by command execution.
+           Default: 4.  Set equal to expected peak concurrent load.
+    -->
+    <param name="worker-threads" value="10"/>
   </settings>
 </configuration>
