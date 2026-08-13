@@ -42,7 +42,22 @@ The response contains command success, raw output when requested, a detected for
 
 ## Quick build
 
-Install the C++ build dependencies on Debian or Ubuntu:
+Clone the repository (master branch) and build from source:
+
+```bash
+# clone the master branch
+git clone --branch master https://github.com/mr-krishnak/mod_grpc_api.git
+cd mod_grpc_api
+
+# make the build script executable and run a local build (no install)
+chmod +x scripts/build-install.sh
+NO_INSTALL=1 ./scripts/build-install.sh
+
+# install the module and configuration
+sudo cmake --install build
+```
+
+Install the C++ build dependencies on Debian or Ubuntu if needed:
 
 ```bash
 sudo apt-get update
@@ -56,19 +71,6 @@ FreeSWITCH development headers are also required. With a typical source installa
 
 ```text
 /usr/local/freeswitch/include/freeswitch/switch.h
-```
-
-Build without installing:
-
-```bash
-chmod +x scripts/build-install.sh
-NO_INSTALL=1 ./scripts/build-install.sh
-```
-
-Install the module and configuration:
-
-```bash
-sudo cmake --install build
 ```
 
 For nonstandard FreeSWITCH paths, pass explicit CMake options:
