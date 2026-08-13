@@ -1,0 +1,66 @@
+syntax = "proto3";
+
+package fsgrpc;
+
+// Controls how much response data the server returns.
+// COMPAT preserves the original module behavior.
+enum ResponseMode {
+  RESPONSE_MODE_COMPAT = 0;
+  RESPONSE_MODE_RAW_ONLY = 1;
+  RESPONSE_MODE_STRUCTURED_ONLY = 2;
+}
+
+// One record row. It works with tabular FreeSWITCH output and JSON rows.
+message Row {
+  map<string, string> fields = 1;
+}
+
+// Tabular output such as "show channels" or selected Sofia commands.
+message TableData {
+  repeated Row rows = 1;
+  string summary = 2;
+  uint32 count = 3;
+}
+
+// Native JSON output such as "show channels as json".
+message JsonData {
+  uint32 row_count = 1;
+  repeated Row rows = 2;
+  map<string, string> fields = 3;
+  string raw = 4;
+}
+
+// Plain output such as "+OK", "-ERR", "status", and "version".
+message PlainData {
+  string response = 1;
+  bool ok = 2;
+}
+
+message ApiRequest {
+  // Normal commands are executed once. The special command "bgapi" treats
+  // arguments as "<nested-command> [nested-arguments]", returns a Job UUID,
+  // and publishes completion through a FreeSWITCH BACKGROUND_JOB event.
+  string command = 1;
+  string arguments = 2;
+  ResponseMode response_mode = 3;
+}
+
+message ApiResponse {
+  bool success = 1;
+  string message = 2;
+  string format = 3; // "json" | "xml" | "table" | "plain"
+
+  // Wire-compatible with the original fields, while expressing that only
+  // one structured representation is returned.
+  oneof data {
+    TableData table = 4;
+    JsonData json = 5;
+    PlainData plain = 6;
+  }
+
+  bool truncated = 7;
+}
+
+service FreeSwitchApi {
+  rpc Execute(ApiRequest) returns (ApiResponse) {}
+}

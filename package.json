@@ -1,0 +1,14 @@
+{
+  "name": "mod-grpc-api-tools",
+  "version": "1.1.1",
+  "private": true,
+  "description": "Example client and stress test for mod_grpc_api",
+  "scripts": {
+    "client": "node examples/node/client.js",
+    "stress": "node scripts/stress-test.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.14.4",
+    "@grpc/proto-loader": "^0.8.1"
+  }
+}

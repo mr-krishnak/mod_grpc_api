@@ -1,0 +1,4 @@
+{
+  "command": "status",
+  "responseMode": "RESPONSE_MODE_RAW_ONLY"
+}

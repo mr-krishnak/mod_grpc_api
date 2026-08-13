@@ -1,0 +1,30 @@
+# Build output
+build/
+build-*/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.so
+*.o
+*.a
+
+# Generated Protobuf files
+*.pb.cc
+*.pb.h
+
+# Node dependencies and logs
+node_modules/
+npm-debug.log*
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp

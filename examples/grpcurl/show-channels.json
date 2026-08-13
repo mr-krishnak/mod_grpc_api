@@ -1,0 +1,5 @@
+{
+  "command": "show",
+  "arguments": "channels as json",
+  "responseMode": "RESPONSE_MODE_STRUCTURED_ONLY"
+}

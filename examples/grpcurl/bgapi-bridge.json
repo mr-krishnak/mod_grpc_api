@@ -1,0 +1,5 @@
+{
+  "command": "bgapi",
+  "arguments": "originate user/1001 &bridge(user/1002)",
+  "responseMode": "RESPONSE_MODE_RAW_ONLY"
+}

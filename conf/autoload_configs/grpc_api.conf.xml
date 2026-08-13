@@ -1,0 +1,47 @@
+<configuration name="grpc_api.conf" description="Asynchronous FreeSWITCH gRPC API">
+  <settings>
+    <!--
+      The default is loopback-only because the module currently uses gRPC
+      insecure transport. For remote access, keep this address private and
+      place the service behind an authenticated TLS/mTLS proxy or VPN.
+    -->
+    <param name="listen-address" value="127.0.0.1:50051"/>
+
+    <!-- FreeSWITCH command execution workers. Start small and benchmark. -->
+    <param name="worker-threads" value="8"/>
+
+    <!-- Total executing + queued RPCs. 0 means unlimited and is not advised. -->
+    <param name="max-concurrent-requests" value="64"/>
+
+    <!-- Bounded, non-blocking worker queue. -->
+    <param name="queue-capacity" value="64"/>
+
+    <!-- Number of outstanding asynchronous gRPC accept operations. -->
+    <param name="acceptor-count" value="8"/>
+
+    <!-- Maximum response retained and serialized by this module. -->
+    <param name="max-response-bytes" value="8388608"/>
+
+    <!-- Grace period passed to gRPC Server::Shutdown. -->
+    <param name="shutdown-grace-ms" value="5000"/>
+
+    <!-- Keep disabled unless grpcurl/Postman reflection is required. -->
+    <param name="enable-reflection" value="false"/>
+
+    <!-- Arguments may contain sensitive data. Enable only for debugging. -->
+    <param name="log-arguments" value="false"/>
+
+    <!--
+      Comma/space-separated API command allowlist. Add only commands required
+      by your application. Exact commands are required except for the special
+      controlled uuid_* rule, which enables the FreeSWITCH uuid_ command
+      family. A bare wildcard and all other wildcard forms are rejected.
+
+      bgapi is implemented by this module as a background wrapper. Its nested
+      command must also be allowed. originate is included so callers can use
+      "bgapi originate ... &bridge(...)". uuid_bridge is covered by uuid_*.
+    -->
+    <param name="allowed-commands"
+           value="status,version,show,bgapi,originate,uuid_*,module_exists,global_getvar"/>
+  </settings>
+</configuration>
